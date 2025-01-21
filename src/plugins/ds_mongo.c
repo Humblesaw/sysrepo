@@ -793,18 +793,21 @@ srpds_load_conv(mongoc_collection_t *module, const struct lys_module *mod, sr_da
     *   |    Dataset [ path(_id) | name | type | module_name | keys | path_modif ]
     *   |
     *   | 3) leafs and leaf-lists (LYS_LEAF and LYS_LEAFLIST)
-    *   |    Dataset [ path(_id) | name | type | module_name | dflt_flag | value | path_modif ]
+    *   |    Dataset [ path(_id) | name | type | module_name | value | dflt_flag | path_modif ]
     *   |
     *   | 4) anydata and anyxml (LYS_ANYDATA and LYS_ANYXML)
-    *   |    Dataset [ path(_id) | name | type | module_name | dflt_flag | value | valtype | path_modif ]
+    *   |    Dataset [ path(_id) | name | type | module_name | value | dflt_flag | valtype | path_modif ]
     *   |
     *   | 5) user-ordered lists
     *   |    Dataset [ path(_id) | name | type | module_name | keys | order | path_no_pred | prev | path_modif ]
     *   |
     *   | 6) user-ordered leaf-lists
-    *   |    Dataset [ path(_id) | name | type | module_name | dflt_flag | value | order | path_no_pred | prev | path_modif ]
+    *   |    Dataset [ path(_id) | name | type | module_name | value | dflt_flag | order | path_no_pred | prev | path_modif ]
     *   |
-    *   | 7) metadata and maxorder (0, 1, 2, #)
+    *   | 7) opaque nodes
+    *   |    Dataset [ path(_id) | name | type | module_name | value | path_modif ]
+    *   |
+    *   | 8/9) metadata and attributes (0, 1, 2, 3, 4, 5, #) ... (0, 1, 2, #) DO NOT LOAD
     *   |
     *   | module_name = NULL - use parent's module | name - use the module specified by this name
     *   | valtype     = 0 - XML | 1 - JSON
@@ -816,6 +819,10 @@ srpds_load_conv(mongoc_collection_t *module, const struct lys_module *mod, sr_da
     *   |     1.2) 1 = is different from running? (for candidate datastore) [ !!! NOT LOADED ]
     *   |     1.3) 2 = owner, group and permissions [ !!! NOT LOADED ]
     *   |    Dataset [ path(_id) | value ]
+    *   |     1.4) 3 = opaque nodes
+    *   |     1.5) 4 = node metadata
+    *   |     1.6) 5 = attribute data for opaque nodes
+    *   |    Dataset [ path_with_name(_id) | name | type | path_to_node | value | path_modif ]
     *   |
     *   | 2) maximum order for a userordered list or leaflist (starting with a #)
     *   |     2.1) # = maximum order [ !!! NOT LOADED ]
@@ -874,28 +881,45 @@ srpds_load_conv(mongoc_collection_t *module, const struct lys_module *mod, sr_da
         }
         type = bson_iter_int32(&iter);
 
-        /* get module name */
-        if (!bson_iter_next(&iter)) {
-            ERRINFO(&err_info, plugin_name, SR_ERR_OPERATION_FAILED, "bson_iter_next()", "");
-            goto cleanup;
-        }
-        module_name = bson_iter_utf8(&iter, NULL);
-        if (module_name && !bson_utf8_validate(module_name, strlen(module_name), 0)) {
-            ERRINFO(&err_info, plugin_name, SR_ERR_OPERATION_FAILED, "bson_iter_utf8()", "");
-            goto cleanup;
-        }
-
-        /* get default flag or keys based on type */
+        /* get module name or path_to_node */
         switch (type) {
-        case SRPDS_DB_LY_TERM:         /* leafs and leaf-lists */
-        case SRPDS_DB_LY_ANY:          /* anydata and anyxml */
-        case SRPDS_DB_LY_LEAFLIST_UO:  /* user-ordered leaf-lists */
+        case SRPDS_DB_LY_CONTAINER:   /* containers */
+        case SRPDS_DB_LY_LIST:        /* lists */
+        case SRPDS_DB_LY_TERM:        /* leafs and leaf-lists */
+        case SRPDS_DB_LY_ANY:         /* anydata and anyxml */
+        case SRPDS_DB_LY_LIST_UO:     /* user-ordered lists */
+        case SRPDS_DB_LY_LEAFLIST_UO: /* user-ordered leaf-lists */
+        case SRPDS_DB_LY_OPAQUE:      /* opaque nodes */
             if (!bson_iter_next(&iter)) {
                 ERRINFO(&err_info, plugin_name, SR_ERR_OPERATION_FAILED, "bson_iter_next()", "");
                 goto cleanup;
             }
-            dflt_flag = bson_iter_as_bool(&iter);
+            module_name = bson_iter_utf8(&iter, NULL);
+            if (module_name && !bson_utf8_validate(module_name, strlen(module_name), 0)) {
+                ERRINFO(&err_info, plugin_name, SR_ERR_OPERATION_FAILED, "bson_iter_utf8()", "");
+                goto cleanup;
+            }
             break;
+
+        case SRPDS_DB_LY_META:  /* metadata */
+        case SRPDS_DB_LY_ATTR:  /* attributes */
+            if (!bson_iter_next(&iter)) {
+                ERRINFO(&err_info, plugin_name, SR_ERR_OPERATION_FAILED, "bson_iter_next()", "");
+                goto cleanup;
+            }
+            path_to_node = bson_iter_utf8(&iter, NULL);
+            if (!bson_utf8_validate(path_to_node, strlen(path_to_node), 0)) {
+                ERRINFO(&err_info, plugin_name, SR_ERR_OPERATION_FAILED, "bson_iter_utf8()", "");
+                goto cleanup;
+            }
+            path = path_to_node;
+            break;
+        default:
+            break;
+        }
+
+        /* get value or keys based on type */
+        switch (type) {
         case SRPDS_DB_LY_LIST:     /* lists */
         case SRPDS_DB_LY_LIST_UO:  /* user-ordered lists */
             if (!bson_iter_next(&iter)) {
@@ -907,15 +931,12 @@ srpds_load_conv(mongoc_collection_t *module, const struct lys_module *mod, sr_da
                 goto cleanup;
             }
             break;
-        default:
-            break;
-        }
-
-        /* get value or order based on type */
-        switch (type) {
         case SRPDS_DB_LY_TERM:         /* leafs and leaf-lists */
         case SRPDS_DB_LY_ANY:          /* anydata and anyxml */
         case SRPDS_DB_LY_LEAFLIST_UO:  /* user-ordered leaf-lists */
+        case SRPDS_DB_LY_OPAQUE:       /* opaque nodes */
+        case SRPDS_DB_LY_META:         /* metadata */
+        case SRPDS_DB_LY_ATTR:         /* attributes */
             if (!bson_iter_next(&iter)) {
                 ERRINFO(&err_info, plugin_name, SR_ERR_OPERATION_FAILED, "bson_iter_next()", "");
                 goto cleanup;
@@ -925,6 +946,21 @@ srpds_load_conv(mongoc_collection_t *module, const struct lys_module *mod, sr_da
                 ERRINFO(&err_info, plugin_name, SR_ERR_OPERATION_FAILED, "bson_iter_utf8()", "");
                 goto cleanup;
             }
+            break;
+        default:
+            break;
+        }
+
+        /* get default flag or order based on type */
+        switch (type) {
+        case SRPDS_DB_LY_TERM:         /* leafs and leaf-lists */
+        case SRPDS_DB_LY_ANY:          /* anydata and anyxml */
+        case SRPDS_DB_LY_LEAFLIST_UO:  /* user-ordered leaf-lists */
+            if (!bson_iter_next(&iter)) {
+                ERRINFO(&err_info, plugin_name, SR_ERR_OPERATION_FAILED, "bson_iter_next()", "");
+                goto cleanup;
+            }
+            dflt_flag = bson_iter_as_bool(&iter);
             break;
         case SRPDS_DB_LY_LIST_UO:  /* user-ordered lists */
             if (!bson_iter_next(&iter)) {
@@ -3408,14 +3444,8 @@ srpds_mongo_load(const struct lys_module *mod, sr_datastore_t ds, sr_cid_t cid, 
         bson_init(&xpath_filter);
     }
 
-    if (ds == SR_DS_OPERATIONAL) {
-        if ((err_info = srpds_load_oper(mdata.module, mod, &xpath_filter, mod_data))) {
-            goto cleanup;
-        }
-    } else {
-        if ((err_info = srpds_load_conv(mdata.module, mod, ds, &xpath_filter, mod_data))) {
-            goto cleanup;
-        }
+    if ((err_info = srpds_load_conv(mdata.module, mod, ds, &xpath_filter, mod_data))) {
+        goto cleanup;
     }
 
 cleanup:
